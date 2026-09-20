@@ -1,0 +1,8 @@
+# @local/dsh-live-tps: live token throughput readout for the web composer stats row.
+# Mounting this host plugin publishes the package's client face; the client
+# half registers a native conversation.composer.dock entry and moves its pill
+# inline after the average tok/s pill inside the shipped stats row. The pill is
+# always visible (em dash until the first reading). No shipped bundle is patched.
+- insert:
+    - id: live-tps-host
+      name: '@local/dsh-live-tps'
