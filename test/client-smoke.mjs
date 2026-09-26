@@ -50,7 +50,7 @@ const requireShim = (id) => {
 };
 
 const face = captured.factory(requireShim);
-const { NS, blockChars, ratioOf, buildCalibration, measureRate, settledRate, smooth, formatTps, displayValue, LiveTpsPill } = face.__internals;
+const { NS, blockChars, ratioOf, buildCalibration, measureRate, settledRate, projectedRate, smooth, formatTps, displayValue, LiveTpsPill } = face.__internals;
 
 /* ---------------- block character accounting ---------------- */
 assert.deepEqual(blockChars([
@@ -165,6 +165,16 @@ assert.deepEqual(settledRate([settledNode(7, 600, 1_000), settledNode(8, 5, 60)]
 assert.equal(settledRate([{ kind: "tool-result", callId: "x" }]), null, "non-assistant nodes carry no rate");
 assert.equal(settledRate([{ kind: "assistant", seq: 1, usage: { outputTokens: 0 }, timing: { firstTokenTime: 0, completedTime: 1_000 } }]), null, "zero output tokens carry no rate");
 
+/* ---------------- host-side sessionStats projection rate ---------------- */
+const stats = (decodeMs, decodeTokens, steps = 12) => ({ turns: 3, steps, llmMs: 9_000, toolMs: 4_000, ttftMs: 900, ttftSteps: 3, decodeMs, decodeTokens });
+assert.equal(projectedRate(undefined), null, "an unserved projection carries no rate");
+assert.equal(projectedRate(null), null, "a null projection carries no rate");
+assert.equal(projectedRate("nope"), null, "a non-object projection carries no rate");
+assert.equal(projectedRate(stats(0, 500)), null, "no decode span yet means no rate");
+assert.equal(projectedRate(stats(5_000, 0)), null, "no decode tokens yet means no rate");
+assert.equal(projectedRate(stats(4_000, 800)), 200, "decodeTokens over decodeMs is the whole-session average");
+assert.equal(projectedRate(stats(2_000, 333, 0)), 166.5, "a step-less session with a span still reports its rate");
+
 /* ---------------- display formatting ---------------- */
 assert.equal(formatTps(9.84), "9.8");
 assert.equal(formatTps(10.4), "10");
@@ -175,9 +185,11 @@ assert.equal(displayValue(9.84), "9.8");
 assert.equal(displayValue(12.3), "12");
 
 /* ---------------- pill render shape (portal + hidden anchor) ---------------- */
+/** Minimal locale formatter: `{name}` placeholders filled from opts, else the key. */
+const t = (key, opts = {}) => key.replace(/\{(\w+)\}/gu, (_, name) => String(opts[name] ?? `{${name}}`));
 const rendered = LiveTpsPill({
 	useChat: (selector) => selector({ legacy: { partial: null, nodes: [] } }),
-	t: (key, opts) => `live ${opts.throughput} tok/s`
+	t
 });
 assert.ok(Array.isArray(rendered) && rendered.length === 2, "component returns [anchor, portal]");
 assert.equal(rendered[0].type, "span");

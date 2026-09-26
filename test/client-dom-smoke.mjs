@@ -93,7 +93,27 @@ const eq = (actual, expected, message) => {
 /* ---------------- host doubles ---------------- */
 /** Seat stubs: idle chat snapshot, locale formatter that keeps the tok/s wording. */
 const useChat = (selector) => selector({ legacy: { partial: null, nodes: [] } });
-const t = (key, opts) => `实时 ${opts.throughput} tok/s`;
+/**
+ * Real locale dictionary, captured from the plugin's own `apply()` so every
+ * assertion below is checked against the shipped copy instead of a hand-written
+ * guess. `{name}` placeholders are filled from opts; an unregistered key fails loud.
+ */
+let registeredDicts = null;
+face.apply({
+	locale: { register(_ns, dicts) { registeredDicts = dicts; return () => {} } },
+	effect: (factory) => { if (typeof factory === "function") factory(); return () => {} },
+	slots: {
+		inject: () => () => {},
+		register: () => ({})
+	}
+});
+assert.ok(registeredDicts !== null && typeof registeredDicts.zh === "object", "apply registers the dictionaries");
+const zhDict = registeredDicts.zh;
+const t = (key, opts = {}) => {
+	const template = zhDict[key];
+	if (typeof template !== "string") throw new Error(`locale key ${JSON.stringify(key)} is not registered`);
+	return String(template).replace(/\{(\w+)\}/gu, (_, name) => String(opts[name] ?? `{${name}}`));
+};
 /**
  * Replica of the shipped composer dock: the display-contents slot outlet div
  * whose React children are the host-owned stats row and our entry. Session
@@ -325,24 +345,26 @@ const statefulChat = () => {
 };
 
 /** Mount one pill with a controllable chat seat and a settable host row. */
-async function mountScene({ nodes = [], partial = null, showRow = true, rowText = "3 轮 12 步 · 42.0 tok/s" }) {
+async function mountScene({ nodes = [], partial = null, showRow = true, rowText = "3 轮 12 步 · 42.0 tok/s", projection, entryKey = "e1" }) {
 	const scene = document.createElement("div");
 	document.body.appendChild(scene);
 	const root = reactDomClient.createRoot(scene);
 	const chat = statefulChat();
 	chat.set({ legacy: { partial, nodes } });
+	const projectionValue = { current: projection };
 	const render = () => root.render(react.createElement("div", { className: "dock" },
 		react.createElement("div", { "data-slot": "conversation.composer.dock", style: { display: "contents" } },
 			showRow ? react.createElement("div", { key: "row", "data-composer-stats": true },
 				react.createElement("span", null, rowText)) : null,
-			react.createElement(LiveTpsPill, { key: "e1", useChat: chat.useChat, t }))));
+			react.createElement(LiveTpsPill, { key: entryKey, useChat: chat.useChat, useProjection: (key) => (key === "sessionStats" ? projectionValue.current : undefined), t }))));
 	render();
 	await settle();
 	return {
 		scene,
 		pill: () => pillIn(scene),
-		async update({ nodes: n, partial: p }) {
+		async update({ nodes: n, partial: p, projection: pr }) {
 			chat.set({ legacy: { partial: p ?? null, nodes: n ?? [] } });
+			if (pr !== undefined) projectionValue.current = pr;
 			render();
 			await settle();
 		},
@@ -415,6 +437,65 @@ async function mountScene({ nodes = [], partial = null, showRow = true, rowText 
 	await settle();
 	eq(scene.pill().textContent, "实时 \u2014 tok/s", "before any settled step the em dash is correct");
 	await scene.unmount();
+}
+
+// ⑧-7 宿主投影是跨视图的回落源：轨迹/记忆页里 legacy.nodes 是空的，读数照样有。
+{
+	const scene = await mountScene({
+		nodes: [],
+		projection: { turns: 3, steps: 40, llmMs: 9_000, toolMs: 4_000, ttftMs: 900, ttftSteps: 3, decodeMs: 4_000, decodeTokens: 800 }
+	});
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	const pill = scene.pill();
+	eq(pill.textContent, "实时 200 tok/s", "the sessionStats projection feeds the rate when the legacy slice is empty");
+	eq(pill.getAttribute("data-source"), "projection", "and the source is reported for diagnosis");
+	eq(pill.getAttribute("data-nodes"), "0", "precondition: no settled nodes in this view");
+	await scene.unmount();
+}
+
+// ⑧-8 没有投影（老宿主）时退回已结算步实测；两者都没有才回到 em dash。
+{
+	const scene = await mountScene({ nodes: [settledNode(7, 300, 3_000)], projection: undefined });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	eq(scene.pill().textContent, "实时 100 tok/s", "without the projection the settled step still feeds the rate");
+	eq(scene.pill().getAttribute("data-source"), "settled", "and reports the settled-step source");
+
+	await scene.update({ nodes: [], projection: null });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	// 读数刻意保留（2026-09-26 的用户诉求）：回落源消失不清零，只在换会话重挂时归零。
+	eq(scene.pill().textContent, "实时 100 tok/s", "a vanished fallback source keeps the last reading by design");
+	await scene.unmount();
+}
+
+// ⑧-8b 换会话 = entry 重挂（scope: session），新会话无数据时回到 em dash。
+{
+	const scene = await mountScene({ nodes: [], projection: undefined, entryKey: "session-b" });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	eq(scene.pill().textContent, "实时 \u2014 tok/s", "a remount for a new session starts from the em dash again");
+	eq(scene.pill().getAttribute("data-source"), "none", "and the source reads none");
+	await scene.unmount();
+}
+
+// ⑧-9 悬停提示带读数来源；读不出数时直接告出三个数据源的实况（用户就是靠悬停发现的）。
+{
+	const scene = await mountScene({ nodes: [], projection: { steps: 40, decodeMs: 4_000, decodeTokens: 800 } });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	ok(/200/.test(scene.pill().getAttribute("title")), "the tooltip carries the raw number");
+	ok(/会话累计均值/.test(scene.pill().getAttribute("title")), "and names the source");
+
+	const blind = await mountScene({ nodes: [], projection: undefined });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	const hint = blind.pill().getAttribute("title");
+	ok(/会话投影：未提供/.test(hint), "a blind pill reports the projection as not served");
+	ok(/已结算步骤：0/.test(hint), "and the settled-step count");
+	await scene.unmount();
+	await blind.unmount();
 }
 
 // ⑧-6 空闲期不常驻定时器（v1 的教训：空闲 setInterval 20Hz 常驻烧 CPU）。

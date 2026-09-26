@@ -21,18 +21,22 @@
 
 **放置策略**：胶囊优先内联进官方的 composer stats 行（紧跟平均 tok/s 胶囊之后）；找不到锚点时回落到 `conversation.composer.dock`。会话切换与卸载都有清理路径，不留残留节点。
 
-**读数的两个来源（0.5.0 起）**：
+**读数的三个来源（0.6.0 起）**：
 
-| 来源 | 何时生效 | 依据 |
-|---|---|---|
-| 3s 窗口瞬时速率 | 流式中，且有新鲜字符增量 | 采样 + 分桶校准换算 |
-| 最近已结算步的实测速率 | 其余任何时候 | `legacy.nodes` 上的 `usage.outputTokens` 与 `firstTokenTime`/`completedTime` |
+| 来源 | 何时生效 | 依据 | 跨视图 |
+|---|---|---|---|
+| 3s 窗口瞬时速率 | 流式中，且有新鲜字符增量 | 采样 + 分桶校准换算 | 否（要 `legacy.partial`） |
+| 宿主 `sessionStats` 投影 | 非流式时的**首选**回落 | `decodeTokens / decodeMs`，宿主侧折整本日志 | **是** |
+| 最近已结算步的实测速率 | 没有投影时的回落 | `legacy.nodes` 上的 `usage.outputTokens` 与 `firstTokenTime`/`completedTime` | 否 |
 
-窗口读数只在流式中、且窗口已满（`dt >= 0.5s`）时才出数，因此三步、无逐字输出的 provider、以及换模型后校准还没收敛的首步，光靠它会把 em dash 挂满整段时间。0.5.0 起这些时段改读**最近一个已结算步的实测速率**：宿主每一步都带真实 `usage` 与逐秒计时，速率本来就在，且"最新一步"在换模型后天然就是新模型自己的步，读数直接跟上切换。因此：
+前两个来源各有一个盲区，正好互补：窗口读数只在流式中、且窗口已满（`dt >= 0.5s`）时才出数，因此短步、无逐字输出的 provider、以及换模型后校准还没收敛的首步，光靠它会把 em dash 挂满整段时间；而 `legacy` 切片是**聊天视图**的折叠——人在轨迹页/记忆页时 dock 照样渲染，但那个视图的材料化节点不喂给它，`legacy.nodes` 会是空的，所有客户端源一起静默答 null。0.5.0 先补了第三个来源，0.6.0 再把**宿主投影**提为首选回落：它与展示档位、当前打开的视图都无关，是官方 `StatsPills` 自己优先用的同一份数据。
 
-- 工作步骤非详细（官方 stats 行整行不渲染）时读数仍在——回落源与展示档位无关；
-- 切换模型后读数不消失、也不停留在旧模型速率；
-- em dash 只出现在本会话挂载后**一个步都还没结算**时。
+- 工作步骤非详细（官方 stats 行整行不渲染）时读数仍在；
+- 切换模型后读数不消失，也不停留在旧模型速率；
+- 在轨迹页等非聊天视图里读数仍在（投影供数）；
+- em dash 只出现在本会话挂载后**一个步都还没结算、且还没开始流式**时。
+
+**诊断**：胶囊带 `data-source`（`window` / `projection` / `settled` / `none`）、`data-tps`、`data-nodes`、`data-projection` 四个属性，悬停提示里还带原始数值与来源名。读数看着不对时，先看 `data-source` 就知道是哪个源在供数；读不出数时提示会直接报出「会话投影：未提供/40 步 · 已结算步骤：0 · 流式中：否」。
 
 定时器只在"还有读数要更新"时挂表：流式中持续跑，追平后自行停止，空闲期不常驻。
 
@@ -52,8 +56,8 @@ dsh plugin --profile web add github:zhang-jiazhi/dsh-live-tps
 lib/index.js             宿主半：空 apply + inject[]（仅用于发布 client face）
 lib/client.js            客户端半：注册 conversation.composer.dock，内联到 stats 行
 cordis.patch.yml         insert 行（不 patch 任何已发布 bundle）
-test/client-smoke.mjs    59 条断言：校准/放置/回落/摘要纯函数
-test/client-dom-smoke.mjs 49 项检查：portal 放置、回退链、会话切换不抛、三场景读数、空闲不挂表
+test/client-smoke.mjs    66 条断言：校准/放置/回落/摘要纯函数
+test/client-dom-smoke.mjs 61 项检查：portal 放置、回退链、会话切换不抛、三场景读数、空闲不挂表
 ```
 
 ```bash
