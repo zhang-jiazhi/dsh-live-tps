@@ -1,7 +1,7 @@
 {
   "name": "@local/dsh-live-tps",
-  "version": "0.2.1",
-  "description": "Live token throughput (tok/s) for the dsh web composer stats row — an always-visible pill placed inline after the average tok/s pill (3s time-anchored window, 200ms ticks, EMA-smoothed, per-bucket measured chars/token calibration).",
+  "version": "0.3.0",
+  "description": "Live token throughput (tok/s) for the dsh web composer stats row — an always-visible pill placed inline after the average tok/s pill (keeps the last reading through tool phases/steps, dimming when idle) (3s time-anchored window, 200ms ticks, EMA-smoothed, per-bucket measured chars/token calibration).",
   "type": "module",
   "main": "lib/index.js",
   "scripts": {
