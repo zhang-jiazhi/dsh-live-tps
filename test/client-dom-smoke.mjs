@@ -93,8 +93,7 @@ const eq = (actual, expected, message) => {
 /* ---------------- host doubles ---------------- */
 /** Seat stubs: idle chat snapshot, locale formatter that keeps the tok/s wording. */
 const useChat = (selector) => selector({ legacy: { partial: null, nodes: [] } });
-const t = (key, opts) => `${opts.throughput} tok/s`;
-
+const t = (key, opts) => `实时 ${opts.throughput} tok/s`;
 /**
  * Replica of the shipped composer dock: the display-contents slot outlet div
  * whose React children are the host-owned stats row and our entry. Session
@@ -149,7 +148,7 @@ const statsRowOf = (scene) => scene.querySelector("[data-stats-row]");
 	ok(pill !== null, "pill rendered");
 	eq(pill.parentElement, statsRowOf(scene), "pill portaled into the stats row");
 	eq(pill.parentElement.lastElementChild, pill, "pill appended after the average tok/s pill");
-	eq(pill.textContent, "\u2014 tok/s", "pill shows the em dash before any reading");
+	eq(pill.textContent, "实时 \u2014 tok/s", "pill shows the em dash before any reading");
 
 	root.unmount();
 	scene.remove();
@@ -292,4 +291,152 @@ const statsRowOf = (scene) => scene.querySelector("[data-stats-row]");
 /* ---------------- ⑦ calibration helpers still exported for the pure smoke ---------------- */
 eq(face.__internals.buildCalibration([]).r, 4.5, "calibration helpers still exported");
 
-console.log(`live-tps client DOM smoke: ${passed} checks passed (portal placement, fallbacks, session-switch unmount)`);
+/* ---------------- ⑧ settled-step fallback: a rate is always shown once a step settles ---------------- */
+/**
+ * A settled assistant node as the host shapes it on `legacy.nodes`: the step's
+ * `finalNode` with provider usage and the durable per-step timing the chat
+ * builder stamps from `step/start`, the first token, and `assistant/message`.
+ * @param seq - node ordering key.
+ * @param outputTokens - provider-reported completion tokens.
+ * @param decodeMs - first-token → assembled-message span.
+ * @returns one settled assistant node.
+ */
+const settledNode = (seq, outputTokens, decodeMs) => ({
+	kind: "assistant",
+	seq,
+	messageId: `m${seq}`,
+	time: 5000 + decodeMs,
+	turn: 1,
+	step: seq,
+	blocks: [{ kind: "text", text: "x".repeat(outputTokens * 3) }],
+	usage: { inputTokens: 100, outputTokens, totalTokens: 100 + outputTokens },
+	timing: { stepStartTime: 5000, firstTokenTime: 5000, completedTime: 5000 + decodeMs }
+});
+
+/** Seat stub whose snapshot the test replaces between renders. */
+const statefulChat = () => {
+	let snapshot = { legacy: { partial: null, nodes: [] } };
+	return {
+		useChat: (selector) => selector(snapshot),
+		set(next) {
+			snapshot = next;
+		}
+	};
+};
+
+/** Mount one pill with a controllable chat seat and a settable host row. */
+async function mountScene({ nodes = [], partial = null, showRow = true, rowText = "3 轮 12 步 · 42.0 tok/s" }) {
+	const scene = document.createElement("div");
+	document.body.appendChild(scene);
+	const root = reactDomClient.createRoot(scene);
+	const chat = statefulChat();
+	chat.set({ legacy: { partial, nodes } });
+	const render = () => root.render(react.createElement("div", { className: "dock" },
+		react.createElement("div", { "data-slot": "conversation.composer.dock", style: { display: "contents" } },
+			showRow ? react.createElement("div", { key: "row", "data-composer-stats": true },
+				react.createElement("span", null, rowText)) : null,
+			react.createElement(LiveTpsPill, { key: "e1", useChat: chat.useChat, t }))));
+	render();
+	await settle();
+	return {
+		scene,
+		pill: () => pillIn(scene),
+		async update({ nodes: n, partial: p }) {
+			chat.set({ legacy: { partial: p ?? null, nodes: n ?? [] } });
+			render();
+			await settle();
+		},
+		async unmount() {
+			root.unmount();
+			scene.remove();
+			await settle();
+		}
+	};
+}
+
+// ⑧-1 步间歇 / 活跃步但零字符：回落读数来自最近一个已结算步的实测速率，不再是 em dash。
+{
+	const scene = await mountScene({ nodes: [settledNode(7, 300, 3000)] });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	eq(scene.pill().textContent, "实时 100 tok/s", "between steps the readout keeps a real rate");
+	eq(scene.pill().getAttribute("data-live"), "false", "idle steps dim the pill but keep the number");
+
+	// 活跃步但没有任何字符增量（provider 不逐字输出）——同样不得停在 em dash。
+	await scene.update({ partial: { turn: 1, step: 8, blocks: [] } });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	eq(scene.pill().textContent, "实时 100 tok/s", "an active step with no character delta still reads the settled rate");
+	await scene.unmount();
+}
+
+// ⑧-2 短步（decode span < 200ms）不得当成速率，回落到上一个可测步。
+{
+	const scene = await mountScene({ nodes: [settledNode(9, 400, 4000), settledNode(10, 5, 60)] });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	eq(scene.pill().textContent, "实时 100 tok/s", "a sub-200ms step is noise; the older measurable step wins");
+	await scene.unmount();
+}
+
+// ⑧-3 换模型后读数跟随新模型的最近一步，而不是消失或停留在旧模型速率。
+{
+	const scene = await mountScene({ nodes: [settledNode(7, 300, 3000)] });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	eq(scene.pill().textContent, "实时 100 tok/s", "precondition: old-model reading on screen");
+
+	await scene.update({ nodes: [settledNode(7, 300, 3000), settledNode(12, 100, 3000)] });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	const after = scene.pill().textContent;
+	ok(after !== null && after.includes("tok/s"), "after a model switch the pill still reports a rate");
+	eq(after, "实时 33 tok/s", "the reading follows the newest step rather than lagging behind stale calibration");
+	await scene.unmount();
+}
+
+// ⑧-4 工作步骤非详细：官方 stats 行整行 return null（speed 与 cacheHit 都缺），读数仍在。
+{
+	const scene = await mountScene({ nodes: [settledNode(3, 250, 2000)], showRow: false });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	eq(scene.scene.querySelector("[data-composer-stats]"), null, "precondition: the host row is gone in compact work-details");
+	const pill = scene.pill();
+	ok(pill !== null, "the pill survives the missing host row");
+	eq(pill.parentElement.hasAttribute("data-slot"), true, "it stays in the dock as the fallback container");
+	eq(pill.textContent, "实时 125 tok/s", "and it still reports a rate");
+	await scene.unmount();
+}
+
+// ⑧-5 本会话尚无任何已结算步：em dash 仍是唯一正确显示。
+{
+	const scene = await mountScene({ nodes: [] });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	eq(scene.pill().textContent, "实时 \u2014 tok/s", "before any settled step the em dash is correct");
+	await scene.unmount();
+}
+
+// ⑧-6 空闲期不常驻定时器（v1 的教训：空闲 setInterval 20Hz 常驻烧 CPU）。
+{
+	let started = 0;
+	const original = globalThis.setInterval;
+	globalThis.setInterval = (handler, ms) => {
+		started += 1;
+		return original(handler, ms);
+	};
+	try {
+		const scene = await mountScene({ nodes: [settledNode(7, 300, 3_000)] });
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		await settle();
+		eq(scene.pill().textContent, "实时 100 tok/s", "precondition: the settled reading is already displayed");
+		started = 0;
+		await new Promise((resolve) => setTimeout(resolve, 400));
+		eq(started, 0, "no timer is re-armed while the displayed rate already matches the newest step");
+		await scene.unmount();
+	} finally {
+		globalThis.setInterval = original;
+	}
+}
+
+console.log(`live-tps client DOM smoke: ${passed} checks passed (portal placement, fallbacks, session-switch unmount, settled-step readout)`);

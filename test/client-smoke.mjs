@@ -7,7 +7,11 @@
  *
  *   node test/client-smoke.mjs
  */
-import assert from "node:assert/strict";
+import nodeAssert from "node:assert/strict";
+/** Counted assert facade so the summary line can never drift from the assertions. */
+let assertionCount = 0;
+const countCall = (name) => (...args) => { assertionCount += 1; return nodeAssert[name](...args); };
+const assert = new Proxy({}, { get: (_target, name) => countCall(name) });
 
 /** Captured module-loader spec from the bundle. */
 let captured = null;
@@ -46,7 +50,7 @@ const requireShim = (id) => {
 };
 
 const face = captured.factory(requireShim);
-const { NS, blockChars, ratioOf, buildCalibration, measureRate, smooth, formatTps, displayValue, LiveTpsPill } = face.__internals;
+const { NS, blockChars, ratioOf, buildCalibration, measureRate, settledRate, smooth, formatTps, displayValue, LiveTpsPill } = face.__internals;
 
 /* ---------------- block character accounting ---------------- */
 assert.deepEqual(blockChars([
@@ -139,6 +143,28 @@ assert.equal(smooth(null, 30), 30);
 assert.ok(Math.abs(smooth(30, 32) - 30.8) < 1e-9, "EMA moves 40% toward the new reading");
 assert.equal(smooth(30, 31), 30, "sub-epsilon moves keep the old value");
 
+/* ---------------- settled-step fallback rate ---------------- */
+const settledNode = (seq, outputTokens, decodeMs) => ({
+	kind: "assistant",
+	seq,
+	messageId: `m${seq}`,
+	time: 5_000 + decodeMs,
+	turn: 1,
+	step: seq,
+	blocks: [{ kind: "text", text: "x".repeat(outputTokens * 3) }],
+	usage: { inputTokens: 100, outputTokens, totalTokens: 100 + outputTokens },
+	timing: { stepStartTime: 5_000, firstTokenTime: 5_000, completedTime: 5_000 + decodeMs }
+});
+assert.equal(settledRate([]), null, "no settled steps means no fallback reading");
+assert.equal(settledRate(null), null, "a missing node list means no fallback reading");
+assert.equal(settledRate([{ kind: "assistant", seq: 1, usage: { outputTokens: 10 } }]), null, "no per-step timing means no reading");
+assert.equal(settledRate([settledNode(1, 10, 60)]), null, "a sub-200ms decode span is timer noise");
+assert.deepEqual(settledRate([settledNode(7, 300, 3_000)]), { tps: 100, seq: 7 }, "outputTokens over the decode span is the measured rate");
+assert.deepEqual(settledRate([settledNode(7, 600, 1_000), settledNode(8, 100, 1_000)]), { tps: 100, seq: 8 }, "the newest measurable step wins");
+assert.deepEqual(settledRate([settledNode(7, 600, 1_000), settledNode(8, 5, 60)]), { tps: 600, seq: 7 }, "an unmeasurable newest step falls through to the older one");
+assert.equal(settledRate([{ kind: "tool-result", callId: "x" }]), null, "non-assistant nodes carry no rate");
+assert.equal(settledRate([{ kind: "assistant", seq: 1, usage: { outputTokens: 0 }, timing: { firstTokenTime: 0, completedTime: 1_000 } }]), null, "zero output tokens carry no rate");
+
 /* ---------------- display formatting ---------------- */
 assert.equal(formatTps(9.84), "9.8");
 assert.equal(formatTps(10.4), "10");
@@ -199,4 +225,4 @@ assert.equal(registrations[0].entry.component, LiveTpsPill);
 assert.equal(effects.length, 2);
 assert.deepEqual(effects.map((e) => e.label), ["live-tps: dictionaries", "live-tps: composer dock"]);
 
-console.log("live-tps client smoke: 51 assertions passed");
+console.log(`live-tps client smoke: ${assertionCount} assertions passed`);

@@ -21,6 +21,21 @@
 
 **放置策略**：胶囊优先内联进官方的 composer stats 行（紧跟平均 tok/s 胶囊之后）；找不到锚点时回落到 `conversation.composer.dock`。会话切换与卸载都有清理路径，不留残留节点。
 
+**读数的两个来源（0.5.0 起）**：
+
+| 来源 | 何时生效 | 依据 |
+|---|---|---|
+| 3s 窗口瞬时速率 | 流式中，且有新鲜字符增量 | 采样 + 分桶校准换算 |
+| 最近已结算步的实测速率 | 其余任何时候 | `legacy.nodes` 上的 `usage.outputTokens` 与 `firstTokenTime`/`completedTime` |
+
+窗口读数只在流式中、且窗口已满（`dt >= 0.5s`）时才出数，因此三步、无逐字输出的 provider、以及换模型后校准还没收敛的首步，光靠它会把 em dash 挂满整段时间。0.5.0 起这些时段改读**最近一个已结算步的实测速率**：宿主每一步都带真实 `usage` 与逐秒计时，速率本来就在，且"最新一步"在换模型后天然就是新模型自己的步，读数直接跟上切换。因此：
+
+- 工作步骤非详细（官方 stats 行整行不渲染）时读数仍在——回落源与展示档位无关；
+- 切换模型后读数不消失、也不停留在旧模型速率；
+- em dash 只出现在本会话挂载后**一个步都还没结算**时。
+
+定时器只在"还有读数要更新"时挂表：流式中持续跑，追平后自行停止，空闲期不常驻。
+
 ## 安装
 
 ```bash
@@ -37,8 +52,8 @@ dsh plugin --profile web add github:zhang-jiazhi/dsh-live-tps
 lib/index.js             宿主半：空 apply + inject[]（仅用于发布 client face）
 lib/client.js            客户端半：注册 conversation.composer.dock，内联到 stats 行
 cordis.patch.yml         insert 行（不 patch 任何已发布 bundle）
-test/client-smoke.mjs    51 条断言：校准/放置/摘要纯函数
-test/client-dom-smoke.mjs 35 项检查：portal 放置、回退链、会话切换不抛
+test/client-smoke.mjs    59 条断言：校准/放置/回落/摘要纯函数
+test/client-dom-smoke.mjs 49 项检查：portal 放置、回退链、会话切换不抛、三场景读数、空闲不挂表
 ```
 
 ```bash
