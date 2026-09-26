@@ -15,7 +15,7 @@
 | 采样间隔 | 200 ms | tick 频率 |
 | 平滑 | EMA α=0.4 | 抑制抖动，同时保留趋势响应 |
 | 死区 | 3000 ms | 超过该时长无新样本则视为已停，读数归零 |
-| 校准 | 分桶测 chars/token | reasoning / output / general 三桶各自统计，取最近 8 个样本 |
+| 校准 | 分桶测 chars/token | reasoning / output / general 三桶各自统计，只取最近 3 个可校准步骤（0.4.0：换模型 1~3 步内收敛，陈旧桶按深度过期回退 general） |
 
 **校准为什么要分桶**：reasoning 与正文的 chars/token 差异很大（思考文本更密）。混在一个比值里会让读数系统性偏移。三桶各自测量后按当前 step 的类型取用；样本不足时回落到 general 比值，再不足则用内置 fallback。
 

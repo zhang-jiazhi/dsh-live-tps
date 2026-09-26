@@ -87,23 +87,42 @@ const generalOnly = buildCalibration([
 assert.equal(generalOnly.r, 1);
 assert.equal(generalOnly.o, 1);
 assert.deepEqual(buildCalibration([]), { r: 4.5, o: 2.5 });
-// 回看深度上限：300 个纯输出节点只会取最新的 8 个（三桶全满即停机），
-// 不再对全历史做 O(N) 扫描。
+// 回看深度上限（0.4.0 语义）：桶只收最近 CAL_LIMIT=3 个可校准节点，
+// 300 个同质节点里只取最新 3 个（比值不变，但扫描有界）。
 const manyGeneral = buildCalibration(Array.from({ length: 300 }, () => ({
 	kind: "assistant",
 	usage: { outputTokens: 2 },
 	blocks: [{ kind: "text", text: "abcdef" }]
 })));
 assert.deepEqual(manyGeneral, { r: 3, o: 3 });
-// 深度上限生效：超上限的旧节点（若被扫到会得到 ratio=1）不参与校准，
-// 结果回落到默认值——旧实现（阈值 24 不可达）会一路扫到它并返回 {r:1,o:1}。
+// 新鲜度语义：唯一可校准节点即使位于 249 个不可校准节点（无字符）之后，
+// 也作为"最新测量"参与校准（它是当前唯一的真实比值来源），不再因扫描
+// 上限被跳过；访问上限 CAL_SCAN_LIMIT 只防病态历史的全量扫描成本。
 const deepNode = { kind: "assistant", usage: { outputTokens: 1 }, blocks: [{ kind: "text", text: "x" }] };
-const tooDeep = buildCalibration([deepNode, ...Array.from({ length: 249 }, () => ({
+const onlyEligible = buildCalibration([deepNode, ...Array.from({ length: 300 }, () => ({
 	kind: "assistant",
 	usage: { outputTokens: 3 },
 	blocks: []
 }))]);
-assert.deepEqual(tooDeep, { r: 4.5, o: 2.5 }, "nodes beyond the 200-node lookback are ignored");
+assert.deepEqual(onlyEligible, { r: 1, o: 1 }, "the only eligible node is the freshest measurement and is used");
+// 访问上限兜底：可校准节点被 400+ 个不可校准节点掩埋时放弃（回落 fallback）。
+const buried = buildCalibration([deepNode, ...Array.from({ length: 700 }, () => ({
+	kind: "assistant",
+	usage: { outputTokens: 3 },
+	blocks: []
+}))]);
+assert.deepEqual(buried, { r: 4.5, o: 2.5 }, "eligible nodes beyond the visit budget fall back");
+// 模型切换收敛：旧模型（有 reasoningTokens，ratio r=2/o=0.5）之后来 3 个
+// 新模型节点（无 reasoningTokens，general ratio=1）→ r/o 桶被深度过期，
+// 全部落到 general=1，不再被旧模型比值污染。
+const oldModel = {
+	kind: "assistant",
+	usage: { outputTokens: 12, reasoningTokens: 4 },
+	blocks: [{ kind: "reasoning", text: "aaaaaaaa" }, { kind: "text", text: "bbbb" }]
+};
+const newModel = { kind: "assistant", usage: { outputTokens: 6 }, blocks: [{ kind: "text", text: "abcdef" }] };
+const switched = buildCalibration([oldModel, newModel, newModel, newModel]);
+assert.deepEqual(switched, { r: 1, o: 1 }, "old-model buckets expire once CAL_LIMIT newer nodes exist");
 
 /* ---------------- windowed rate + EMA ---------------- */
 const ratios = { r: 2, o: 2 };
