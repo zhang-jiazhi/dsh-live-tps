@@ -50,7 +50,7 @@ const requireShim = (id) => {
 };
 
 const face = captured.factory(requireShim);
-const { NS, blockChars, ratioOf, buildCalibration, measureRate, settledRate, projectedRate, smooth, formatTps, displayValue, LiveTpsPill } = face.__internals;
+const { NS, blockChars, ratioOf, buildCalibration, measureRate, settledRate, projectedRate, pickReading, smooth, formatTps, displayValue, LiveTpsPill } = face.__internals;
 
 /* ---------------- block character accounting ---------------- */
 assert.deepEqual(blockChars([
@@ -159,11 +159,22 @@ assert.equal(settledRate([]), null, "no settled steps means no fallback reading"
 assert.equal(settledRate(null), null, "a missing node list means no fallback reading");
 assert.equal(settledRate([{ kind: "assistant", seq: 1, usage: { outputTokens: 10 } }]), null, "no per-step timing means no reading");
 assert.equal(settledRate([settledNode(1, 10, 60)]), null, "a sub-200ms decode span is timer noise");
-assert.deepEqual(settledRate([settledNode(7, 300, 3_000)]), { tps: 100, seq: 7 }, "outputTokens over the decode span is the measured rate");
-assert.deepEqual(settledRate([settledNode(7, 600, 1_000), settledNode(8, 100, 1_000)]), { tps: 100, seq: 8 }, "the newest measurable step wins");
-assert.deepEqual(settledRate([settledNode(7, 600, 1_000), settledNode(8, 5, 60)]), { tps: 600, seq: 7 }, "an unmeasurable newest step falls through to the older one");
+assert.deepEqual(settledRate([settledNode(7, 300, 3_000)]), { tps: 100, seq: 7, at: 8_000 }, "outputTokens over the decode span is the measured rate, timestamped by completedTime");
+assert.deepEqual(settledRate([settledNode(7, 600, 1_000), settledNode(8, 100, 1_000)]), { tps: 100, seq: 8, at: 6_000 }, "the newest measurable step wins");
+assert.deepEqual(settledRate([settledNode(7, 600, 1_000), settledNode(8, 5, 60)]), { tps: 600, seq: 7, at: 6_000 }, "an unmeasurable newest step falls through to the older one");
 assert.equal(settledRate([{ kind: "tool-result", callId: "x" }]), null, "non-assistant nodes carry no rate");
 assert.equal(settledRate([{ kind: "assistant", seq: 1, usage: { outputTokens: 0 }, timing: { firstTokenTime: 0, completedTime: 1_000 } }]), null, "zero output tokens carry no rate");
+
+/* ---------------- pickReading: measured sources beat the average ---------------- */
+const w = (tps, at) => ({ tps, at });
+const st = (tps, at) => ({ tps, seq: 9, at });
+assert.equal(pickReading(null, null, null), null, "no source at all means the em dash");
+assert.deepEqual(pickReading(null, null, 200), { via: "projection", tps: 200, at: null }, "with nothing measured the whole-session average is the honest last resort");
+assert.deepEqual(pickReading(null, st(100, 8_000), 200), { via: "settled", tps: 100, at: 8_000 }, "a measured step outranks the average it would otherwise duplicate");
+assert.deepEqual(pickReading(w(300, 9_000), st(100, 8_000), 200), { via: "window", tps: 300, at: 9_000 }, "the window sample that ended the last step is newer than the step, so it wins");
+assert.deepEqual(pickReading(w(300, 7_000), st(100, 8_000), 200), { via: "settled", tps: 100, at: 8_000 }, "an older window sample yields to the newer settled step");
+assert.deepEqual(pickReading(null, st(100, 8_000), null), { via: "settled", tps: 100, at: 8_000 }, "the average is never needed when a step was measured");
+assert.deepEqual(pickReading(w(0, 9_000), null, 200), { via: "projection", tps: 200, at: null }, "a zero-valued window reading is not a measurement");
 
 /* ---------------- host-side sessionStats projection rate ---------------- */
 const stats = (decodeMs, decodeTokens, steps = 12) => ({ turns: 3, steps, llmMs: 9_000, toolMs: 4_000, ttftMs: 900, ttftSteps: 3, decodeMs, decodeTokens });

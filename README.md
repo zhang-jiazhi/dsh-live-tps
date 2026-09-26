@@ -21,23 +21,25 @@
 
 **放置策略**：胶囊优先内联进官方的 composer stats 行（紧跟平均 tok/s 胶囊之后）；找不到锚点时回落到 `conversation.composer.dock`。会话切换与卸载都有清理路径，不留残留节点。
 
-**读数的三个来源（0.6.0 起）**：
+**读数的三个来源（0.6.1 起）**：
 
 | 来源 | 何时生效 | 依据 | 跨视图 |
 |---|---|---|---|
 | 3s 窗口瞬时速率 | 流式中，且有新鲜字符增量 | 采样 + 分桶校准换算 | 否（要 `legacy.partial`） |
-| 宿主 `sessionStats` 投影 | 非流式时的**首选**回落 | `decodeTokens / decodeMs`，宿主侧折整本日志 | **是** |
-| 最近已结算步的实测速率 | 没有投影时的回落 | `legacy.nodes` 上的 `usage.outputTokens` 与 `firstTokenTime`/`completedTime` | 否 |
+| 最近已结算步的实测速率 | 步间歇、短步、换模型后首步 | `legacy.nodes` 上的 `usage.outputTokens` 与 `firstTokenTime`/`completedTime` | 否 |
+| 宿主 `sessionStats` 投影 | **仅当连一个实测值都没有时** | `decodeTokens / decodeMs`，宿主侧折整本日志 | **是** |
 
-前两个来源各有一个盲区，正好互补：窗口读数只在流式中、且窗口已满（`dt >= 0.5s`）时才出数，因此短步、无逐字输出的 provider、以及换模型后校准还没收敛的首步，光靠它会把 em dash 挂满整段时间；而 `legacy` 切片是**聊天视图**的折叠——人在轨迹页/记忆页时 dock 照样渲染，但那个视图的材料化节点不喂给它，`legacy.nodes` 会是空的，所有客户端源一起静默答 null。0.5.0 先补了第三个来源，0.6.0 再把**宿主投影**提为首选回落：它与展示档位、当前打开的视图都无关，是官方 `StatsPills` 自己优先用的同一份数据。
+两个客户端源和一个兜底源的分工，按**新鲜度**而不是固定优先级排：窗口采样在流式结束时比该步的 `completedTime` 更新，所以刚结束的一步继续显示刚测到的瞬时值；下一步一落地，它的 `completedTime` 又比旧窗口采样更新，读数随之换到新步——换模型后自然就跟上新模型。
+
+宿主投影降为最后兜底，是 0.6.1 修的一个回归：0.6.0 把它设成了**首选**回落，结果同一会话里只要投影有值，读数就永远是 `decodeTokens/decodeMs`——那正是官方 `StatsPills` 自己显示的数，于是胶囊变成第二份"平均速度"。投影只保留一个不可替代的场景：`legacy` 切片没被材料化时（轨迹页/记忆页 dock 照样渲染，但聊天视图的节点不喂给它），否则那种视图下读数会整个消失。
 
 - 工作步骤非详细（官方 stats 行整行不渲染）时读数仍在；
-- 切换模型后读数不消失，也不停留在旧模型速率；
-- 在轨迹页等非聊天视图里读数仍在（投影供数）；
+- 切换模型后读数跟随新模型最近一步，不停留在旧模型速率；
+- 流式结束不跳回均值，保留刚测到的瞬时值；
+- 只在既没流式过、也没结算过任何可测步的视图里，才显示整日志均值（tooltip 会标注"非实时"）；
 - em dash 只出现在本会话挂载后**一个步都还没结算、且还没开始流式**时。
 
-**诊断**：胶囊带 `data-source`（`window` / `projection` / `settled` / `none`）、`data-tps`、`data-nodes`、`data-projection` 四个属性，悬停提示里还带原始数值与来源名。读数看着不对时，先看 `data-source` 就知道是哪个源在供数；读不出数时提示会直接报出「会话投影：未提供/40 步 · 已结算步骤：0 · 流式中：否」。
-
+**诊断**：胶囊带 `data-source`（`window` / `settled` / `projection` / `none`）、`data-tps`、`data-nodes`、`data-projection` 四个属性，悬停提示里还带原始数值与来源名。读数看着不对时，先看 `data-source` 就知道是哪个源在供数；显示成均值时那一定是 `projection`，说明客户端两个源都没数据。
 定时器只在"还有读数要更新"时挂表：流式中持续跑，追平后自行停止，空闲期不常驻。
 
 ## 安装
@@ -56,8 +58,8 @@ dsh plugin --profile web add github:zhang-jiazhi/dsh-live-tps
 lib/index.js             宿主半：空 apply + inject[]（仅用于发布 client face）
 lib/client.js            客户端半：注册 conversation.composer.dock，内联到 stats 行
 cordis.patch.yml         insert 行（不 patch 任何已发布 bundle）
-test/client-smoke.mjs    66 条断言：校准/放置/回落/摘要纯函数
-test/client-dom-smoke.mjs 61 项检查：portal 放置、回退链、会话切换不抛、三场景读数、空闲不挂表
+test/client-smoke.mjs    73 条断言：校准/放置/回落/摘要纯函数
+test/client-dom-smoke.mjs 64 项检查：portal 放置、回退链、会话切换不抛、三场景读数、空闲不挂表
 ```
 
 ```bash

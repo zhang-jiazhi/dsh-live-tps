@@ -439,7 +439,24 @@ async function mountScene({ nodes = [], partial = null, showRow = true, rowText 
 	await scene.unmount();
 }
 
-// ⑧-7 宿主投影是跨视图的回落源：轨迹/记忆页里 legacy.nodes 是空的，读数照样有。
+// ⑧-6 同一个会话里既有已结算步、又有宿主投影时，必须显示实测值而不是整日志均值。
+//      这正是用户 2026-09-26 反馈的回归：投影一旦被设为首选回落，读数就和官方
+//      StatsPills 的 decodeTokens/decodeMs 一模一样，成了"平均速度"。
+{
+	const scene = await mountScene({
+		nodes: [settledNode(7, 600, 1000), settledNode(8, 100, 1000)],
+		projection: { turns: 3, steps: 40, llmMs: 9000, toolMs: 4000, ttftMs: 900, ttftSteps: 3, decodeMs: 4000, decodeTokens: 800 }
+	});
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	const pill = scene.pill();
+	eq(pill.textContent, "实时 100 tok/s", "the newest measured step is displayed, not the 200 tok/s whole-session average");
+	eq(pill.getAttribute("data-source"), "settled", "and the measured source is reported");
+	ok(!pill.textContent.includes("200"), "the average must not be shown while a measurement exists");
+	await scene.unmount();
+}
+
+// ⑧-7 宿主投影只是最后兜底：只在没有任何客户端实测时（轨迹/记忆页 legacy 为空）才供数。
 {
 	const scene = await mountScene({
 		nodes: [],
@@ -448,7 +465,7 @@ async function mountScene({ nodes = [], partial = null, showRow = true, rowText 
 	await new Promise((resolve) => setTimeout(resolve, 300));
 	await settle();
 	const pill = scene.pill();
-	eq(pill.textContent, "实时 200 tok/s", "the sessionStats projection feeds the rate when the legacy slice is empty");
+	eq(pill.textContent, "实时 200 tok/s", "as a last resort the projection still supplies a number when the legacy slice is empty");
 	eq(pill.getAttribute("data-source"), "projection", "and the source is reported for diagnosis");
 	eq(pill.getAttribute("data-nodes"), "0", "precondition: no settled nodes in this view");
 	await scene.unmount();
@@ -486,7 +503,7 @@ async function mountScene({ nodes = [], partial = null, showRow = true, rowText 
 	await new Promise((resolve) => setTimeout(resolve, 300));
 	await settle();
 	ok(/200/.test(scene.pill().getAttribute("title")), "the tooltip carries the raw number");
-	ok(/会话累计均值/.test(scene.pill().getAttribute("title")), "and names the source");
+	ok(/整会话均值/.test(scene.pill().getAttribute("title")), "and names the source, flagging it is not live");
 
 	const blind = await mountScene({ nodes: [], projection: undefined });
 	await new Promise((resolve) => setTimeout(resolve, 300));
