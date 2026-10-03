@@ -33,7 +33,8 @@ const reactStub = {
 	useMemo: (compute) => compute(),
 	useRef: (value) => ({ current: value }),
 	useState: (value) => [value, () => {}],
-	useEffect: () => {}
+	useEffect: () => {},
+	useLayoutEffect: () => {}
 };
 const jsxStub = {
 	jsx: (type, props) => ({ type, props }),
@@ -50,7 +51,7 @@ const requireShim = (id) => {
 };
 
 const face = captured.factory(requireShim);
-const { NS, blockChars, ratioOf, buildCalibration, measureRate, settledRate, projectedRate, pickReading, smooth, formatTps, displayValue, LiveTpsPill } = face.__internals;
+const { NS, blockChars, ratioOf, buildCalibration, measureRate, settledRate, isTokenDelta, firstTokenTimeOf, durableRateFromEntries, chooseReading, isStatsRowText, smooth, formatTps, displayValue, LiveTpsPill } = face.__internals;
 
 /* ---------------- block character accounting ---------------- */
 assert.deepEqual(blockChars([
@@ -159,32 +160,99 @@ assert.equal(settledRate([]), null, "no settled steps means no fallback reading"
 assert.equal(settledRate(null), null, "a missing node list means no fallback reading");
 assert.equal(settledRate([{ kind: "assistant", seq: 1, usage: { outputTokens: 10 } }]), null, "no per-step timing means no reading");
 assert.equal(settledRate([settledNode(1, 10, 60)]), null, "a sub-200ms decode span is timer noise");
-assert.deepEqual(settledRate([settledNode(7, 300, 3_000)]), { tps: 100, seq: 7, at: 8_000 }, "outputTokens over the decode span is the measured rate, timestamped by completedTime");
-assert.deepEqual(settledRate([settledNode(7, 600, 1_000), settledNode(8, 100, 1_000)]), { tps: 100, seq: 8, at: 6_000 }, "the newest measurable step wins");
-assert.deepEqual(settledRate([settledNode(7, 600, 1_000), settledNode(8, 5, 60)]), { tps: 600, seq: 7, at: 6_000 }, "an unmeasurable newest step falls through to the older one");
+assert.deepEqual(settledRate([settledNode(7, 300, 3_000)]), { via: "settled", tps: 100, seq: 7, at: 8_000 }, "outputTokens over the decode span is the measured rate, timestamped by completedTime");
+assert.deepEqual(settledRate([settledNode(7, 600, 1_000), settledNode(8, 100, 1_000)]), { via: "settled", tps: 100, seq: 8, at: 6_000 }, "the newest measurable step wins");
+assert.deepEqual(settledRate([settledNode(7, 600, 1_000), settledNode(8, 5, 60)]), { via: "settled", tps: 600, seq: 7, at: 6_000 }, "an unmeasurable newest step falls through to the older one");
 assert.equal(settledRate([{ kind: "tool-result", callId: "x" }]), null, "non-assistant nodes carry no rate");
 assert.equal(settledRate([{ kind: "assistant", seq: 1, usage: { outputTokens: 0 }, timing: { firstTokenTime: 0, completedTime: 1_000 } }]), null, "zero output tokens carry no rate");
 
-/* ---------------- pickReading: measured sources beat the average ---------------- */
-const w = (tps, at) => ({ tps, at });
-const st = (tps, at) => ({ tps, seq: 9, at });
-assert.equal(pickReading(null, null, null), null, "no source at all means the em dash");
-assert.deepEqual(pickReading(null, null, 200), { via: "projection", tps: 200, at: null }, "with nothing measured the whole-session average is the honest last resort");
-assert.deepEqual(pickReading(null, st(100, 8_000), 200), { via: "settled", tps: 100, at: 8_000 }, "a measured step outranks the average it would otherwise duplicate");
-assert.deepEqual(pickReading(w(300, 9_000), st(100, 8_000), 200), { via: "window", tps: 300, at: 9_000 }, "the window sample that ended the last step is newer than the step, so it wins");
-assert.deepEqual(pickReading(w(300, 7_000), st(100, 8_000), 200), { via: "settled", tps: 100, at: 8_000 }, "an older window sample yields to the newer settled step");
-assert.deepEqual(pickReading(null, st(100, 8_000), null), { via: "settled", tps: 100, at: 8_000 }, "the average is never needed when a step was measured");
-assert.deepEqual(pickReading(w(0, 9_000), null, 200), { via: "projection", tps: 200, at: null }, "a zero-valued window reading is not a measurement");
+/* ---------------- durable stream timeline → first-token time ---------------- */
+assert.equal(isTokenDelta({ type: "text-delta", text: "" }), false, "an empty text delta is not output");
+assert.equal(isTokenDelta({ type: "reasoning-delta", text: "x" }), true);
+assert.equal(isTokenDelta({ type: "tool-call-delta", argumentsDelta: "" }), false);
+assert.equal(isTokenDelta({ type: "tool-call-delta", argumentsDelta: "", name: "bash" }), true, "a name-bearing tool delta is output");
+assert.equal(isTokenDelta({ type: "usage", usage: {} }), false, "bookkeeping chunks are not output");
+assert.equal(firstTokenTimeOf(null), null, "a missing stream has no first token");
+assert.equal(firstTokenTimeOf([{ type: "chunk", time: 100, chunk: { type: "block-start", index: 0, blockType: "reasoning" } }]), null, "block markers are not output");
+assert.equal(firstTokenTimeOf([
+	{ type: "chunk", time: 100, chunk: { type: "block-start", index: 0, blockType: "text" } },
+	{ type: "chunk", time: 250, chunk: { type: "text-delta", index: 0, text: "hi" } }
+]), 250, "the first non-empty delta carries the first-token time");
+// packed runs: time0 + cumulative dt, empty members skipped
+assert.equal(firstTokenTimeOf([
+	{ type: "chunk", time: 100, chunk: { type: "block-start", index: 0, blockType: "reasoning" } },
+	{ type: "reasoning-chunks", time0: 400, index: 0, dt: [10, 5, 7], texts: ["", "The", " model"] }
+]), 410, "packed reasoning runs walk time0 + dt and skip empty members");
+assert.equal(firstTokenTimeOf([
+	{ type: "text-chunks", time0: 900, index: 0, dt: [20], texts: ["", "answer"] }
+]), 920, "packed text runs work the same way");
+assert.equal(firstTokenTimeOf([
+	{ type: "tool-call-chunks", time0: 1_000, index: 0, dt: [3], id: "c1", name: "bash", args: ['{"x"', ":1}"] }
+]), 1_000, "a name-bearing packed tool run starts at time0");
+assert.equal(firstTokenTimeOf([{ type: "usage-chunks", time0: 1_000, dt: [], texts: [] }]), null, "an unknown packed record is ignored");
 
-/* ---------------- host-side sessionStats projection rate ---------------- */
-const stats = (decodeMs, decodeTokens, steps = 12) => ({ turns: 3, steps, llmMs: 9_000, toolMs: 4_000, ttftMs: 900, ttftSteps: 3, decodeMs, decodeTokens });
-assert.equal(projectedRate(undefined), null, "an unserved projection carries no rate");
-assert.equal(projectedRate(null), null, "a null projection carries no rate");
-assert.equal(projectedRate("nope"), null, "a non-object projection carries no rate");
-assert.equal(projectedRate(stats(0, 500)), null, "no decode span yet means no rate");
-assert.equal(projectedRate(stats(5_000, 0)), null, "no decode tokens yet means no rate");
-assert.equal(projectedRate(stats(4_000, 800)), 200, "decodeTokens over decodeMs is the whole-session average");
-assert.equal(projectedRate(stats(2_000, 333, 0)), 166.5, "a step-less session with a span still reports its rate");
+/* ---------------- durable event-window rate (reload / session switch) ---------------- */
+const durableEvent = (seq, time, firstTokenTime, outputTokens, stream) => ({
+	event: {
+		type: "assistant/message",
+		seq,
+		time,
+		data: {
+			usage: { outputTokens },
+			stream: stream ?? [
+				{ type: "chunk", time: firstTokenTime, chunk: { type: "text-delta", index: 0, text: "hi" } }
+			]
+		}
+	}
+});
+assert.equal(durableRateFromEntries(null), null, "a missing event window has no reading");
+assert.equal(durableRateFromEntries([]), null, "an empty window has no reading");
+assert.equal(durableRateFromEntries([{ event: { type: "step/end", seq: 1, time: 10, data: {} } }]), null, "non-message events carry no rate");
+assert.equal(durableRateFromEntries([durableEvent(4, 5_000, 4_000, 0)]), null, "zero output tokens carry no rate");
+assert.equal(durableRateFromEntries([durableEvent(4, 5_100, 5_000, 50)]), null, "a sub-200ms decode span is timer noise");
+assert.deepEqual(durableRateFromEntries([durableEvent(4, 8_000, 5_000, 300)]), { via: "durable", tps: 100, at: 8_000, seq: 4 }, "outputTokens over the durable decode span is the measured rate");
+assert.deepEqual(
+	durableRateFromEntries([durableEvent(4, 8_000, 5_000, 300), { event: { type: "step/end", seq: 5, time: 9_000, data: {} } }]),
+	{ via: "durable", tps: 100, at: 8_000, seq: 4 },
+	"trailing non-message entries are skipped"
+);
+assert.deepEqual(
+	durableRateFromEntries([durableEvent(4, 8_000, 5_000, 300), durableEvent(9, 12_000, 10_000, 100)]),
+	{ via: "durable", tps: 50, at: 12_000, seq: 9 },
+	"the newest measurable message wins"
+);
+assert.deepEqual(
+	durableRateFromEntries([durableEvent(4, 8_000, 5_000, 300), durableEvent(9, 12_000, 11_990, 100)]),
+	{ via: "durable", tps: 100, at: 8_000, seq: 4 },
+	"an unmeasurable newest message falls through to the older one"
+);
+assert.deepEqual(
+	durableRateFromEntries([durableEvent(9, 12_000, 10_000, 100, [{ type: "usage-chunks", time0: 1, dt: [], texts: [] }])]),
+	null,
+	"a message whose stream carries no output token is skipped"
+);
+
+/* ---------------- chooseReading: measured readings only, never the average ---------------- */
+const w = (tps, at) => ({ tps, at });
+const settledReading = (tps, at) => ({ via: "settled", tps, seq: 9, at });
+const durableReading = (tps, at) => ({ via: "durable", tps, seq: 9, at });
+assert.equal(chooseReading(false, null, null), null, "no source at all means the em dash");
+assert.equal(chooseReading(true, null, null), null, "an unmeasurable first step still shows the em dash");
+assert.deepEqual(chooseReading(false, null, settledReading(100, 8_000)), settledReading(100, 8_000), "the settled measurement is shown while idle");
+assert.deepEqual(chooseReading(true, w(300, 9_000), settledReading(100, 8_000)), { via: "window", tps: 300, at: 9_000 }, "while streaming the live window estimate wins");
+assert.deepEqual(chooseReading(false, w(300, 9_000), durableReading(100, 8_000)), durableReading(100, 8_000), "once the step settles the real step rate replaces the estimate");
+assert.deepEqual(chooseReading(false, w(300, 9_000), null), { via: "window", tps: 300, at: 9_000 }, "with no settled measurement the last window estimate is kept");
+assert.deepEqual(chooseReading(true, w(0, 9_000), settledReading(100, 8_000)), settledReading(100, 8_000), "a zero-valued window reading is not a measurement");
+assert.deepEqual(chooseReading(true, null, durableReading(88, 7_000)), durableReading(88, 7_000), "the durable reading bridges the gap between steps");
+assert.deepEqual(chooseReading(false, null, null, settledReading(100, 8_000)), settledReading(100, 8_000), "the last displayed reading is held when every source disappears");
+assert.equal(chooseReading(false, null, null, null), null, "a remount with no reading shows the em dash");
+assert.deepEqual(chooseReading(true, null, null, { via: "settled", tps: 0, seq: 1, at: 1 }), null, "a zero-valued held reading is not a measurement");
+
+/* ---------------- shipped-row anchor probe (no word boundary after tok/s) ---------------- */
+assert.equal(isStatsRowText({ textContent: "1 轮 1 步·122 tok/s4.2K tok·缓存命中 0%" }), true, "the real shipped row matches even with another pill glued to it");
+assert.equal(isStatsRowText({ textContent: "12 steps · 42.0 tok/s" }), true, "the spaced form still matches");
+assert.equal(isStatsRowText({ textContent: "4.2K tok·缓存命中 0%" }), false, "a row without the average readout does not match");
+assert.equal(isStatsRowText(null), false, "a missing child does not match");
 
 /* ---------------- display formatting ---------------- */
 assert.equal(formatTps(9.84), "9.8");
@@ -200,7 +268,9 @@ assert.equal(displayValue(12.3), "12");
 const t = (key, opts = {}) => key.replace(/\{(\w+)\}/gu, (_, name) => String(opts[name] ?? `{${name}}`));
 const rendered = LiveTpsPill({
 	useChat: (selector) => selector({ legacy: { partial: null, nodes: [] } }),
-	t
+	t,
+	sessionId: "session-1",
+	liveTpsSessions: null
 });
 assert.ok(Array.isArray(rendered) && rendered.length === 2, "component returns [anchor, portal]");
 assert.equal(rendered[0].type, "span");
@@ -212,7 +282,11 @@ assert.equal(rendered[1], null, "no portal before the mount effect picks a conta
 const effects = [];
 const dictionaries = [];
 const registrations = [];
+const sessionsStub = {
+	binding: () => void 0
+};
 const ctx = {
+	sessions: sessionsStub,
 	effect(fn, label) {
 		effects.push({ label, dispose: fn() });
 	},
@@ -233,7 +307,9 @@ const ctx = {
 	}
 };
 face.apply(ctx);
-assert.deepEqual(face.inject, ["slots", "locale"]);
+assert.deepEqual(face.inject, ["slots", "locale", "sessions"]);
+assert.deepEqual(face.__internals.durableRate(sessionsStub, "session-1"), null, "a binding-less session carries no durable reading");
+assert.deepEqual(face.__internals.durableRate(null, "session-1"), null, "an absent sessions service carries no durable reading");
 assert.equal(dictionaries.length, 1);
 assert.equal(dictionaries[0].ns, NS);
 assert.deepEqual(Object.keys(dictionaries[0].dicts).sort(), ["en", "zh"]);
@@ -242,8 +318,9 @@ assert.equal(registrations.length, 1);
 assert.equal(registrations[0].name, "conversation.composer.dock");
 assert.equal(registrations[0].entry.options.name, "conversation.composer.dock");
 assert.equal(registrations[0].entry.options.id, "live-tps");
-assert.equal(registrations[0].entry.options.order, 1);
+assert.equal(registrations[0].entry.options.order, 2);
 assert.equal(registrations[0].entry.options.locale, NS);
+assert.equal(registrations[0].entry.options.inject().liveTpsSessions, sessionsStub, "the entry inject hands the sessions service to the pill");
 assert.equal(registrations[0].entry.component, LiveTpsPill);
 assert.equal(effects.length, 2);
 assert.deepEqual(effects.map((e) => e.label), ["live-tps: dictionaries", "live-tps: composer dock"]);

@@ -230,34 +230,22 @@ const statsRowOf = (scene) => scene.querySelector("[data-stats-row]");
 	await settle();
 }
 
-/* ---------------- ④ decodeMs=0 → dock fallback + one warn; tok/s appearing → migrate ---------------- */
+/* ---------------- ③b 宿主真实行文案：tok/s 后面紧跟另一个胶囊，无词边界 ---------------- */
+// 桌面版实测行文案是 `1 轮 1 步·122 tok/s4.2K tok·缓存命中 0%`：`tok/s` 的 `s` 后面
+// 紧跟 token 数的 `4`，没有词边界。旧锚点 /\btok\/s\b/ 因此判定失败 → pill 永远留在
+// dock 里、每次会话都打印"找不到 stats 行"的告警（2026-09-26 真实 DOM 证据）。
 {
 	const { scene, root } = freshScene();
-	const warns = [];
-	const originalWarn = console.warn;
-	console.warn = (...parts) => warns.push(parts.join(" "));
-	try {
-		root.render(react.createElement(Dock, { entryKey: "e1", showTps: false })); // decodeMs=0：行内没有 tok/s 文本
-		await settle();
-		const dock = scene.querySelector("[data-slot]");
-		const row = statsRowOf(scene);
-		eq(pillIn(dock).parentElement, dock, "row without tok/s text keeps the pill in the dock");
-		eq(warns.length, 1, "warned once for the missing anchor");
-		ok(warns[0].includes("decodeMs=0"), "warn text states the decodeMs=0 condition");
+	root.render(react.createElement(Dock, { entryKey: "e1", tps: "1 轮 1 步·122 tok/s4.2K tok·缓存命中 0%" }));
+	await settle();
+	const dock = scene.querySelector("[data-slot]");
+	eq(pillIn(dock).parentElement, statsRowOf(scene), "a token-count pill glued to tok/s does not hide the stats row");
+	eq(pillIn(dock).parentElement.lastElementChild, pillIn(dock), "and the pill still follows the shipped readout");
 
-		// 平均速度出现：宿主在按钮 label 里插入 tok/s 文本节点（结构性 childList 突变）
-		root.render(react.createElement(Dock, { entryKey: "e1", showTps: true }));
-		await settle();
-		eq(pillIn(dock).parentElement, row, "pill migrates into the row once tok/s appears");
-		eq(warns.length, 1, "still only one warn");
-	} finally {
-		console.warn = originalWarn;
-	}
 	root.unmount();
 	scene.remove();
 	await settle();
 }
-
 /* ---------------- ⑤ unmount with row present: no throw, no residue ---------------- */
 {
 	const { scene, root } = freshScene();
@@ -345,18 +333,22 @@ const statefulChat = () => {
 };
 
 /** Mount one pill with a controllable chat seat and a settable host row. */
-async function mountScene({ nodes = [], partial = null, showRow = true, rowText = "3 轮 12 步 · 42.0 tok/s", projection, entryKey = "e1" }) {
+async function mountScene({ nodes = [], partial = null, showRow = true, rowText = "3 轮 12 步 · 42.0 tok/s", projection, entryKey = "e1", durableEntries, sessionId = "session-1", rowMarker = "activity" }) {
 	const scene = document.createElement("div");
 	document.body.appendChild(scene);
 	const root = reactDomClient.createRoot(scene);
 	const chat = statefulChat();
 	chat.set({ legacy: { partial, nodes } });
 	const projectionValue = { current: projection };
+	const rowState = { show: showRow };
+	const sessions = durableEntries === undefined ? null : {
+		binding: (id) => (id === sessionId ? { eventSource: { getSnapshot: () => ({ entries: typeof durableEntries === "function" ? durableEntries() : durableEntries }) } } : void 0)
+	};
 	const render = () => root.render(react.createElement("div", { className: "dock" },
 		react.createElement("div", { "data-slot": "conversation.composer.dock", style: { display: "contents" } },
-			showRow ? react.createElement("div", { key: "row", "data-composer-stats": true },
+			rowState.show ? react.createElement("div", { key: "row", ...(rowMarker === true ? { "data-composer-stats": true } : rowMarker ? { "data-composer-stat": rowMarker } : {}) },
 				react.createElement("span", null, rowText)) : null,
-			react.createElement(LiveTpsPill, { key: entryKey, useChat: chat.useChat, useProjection: (key) => (key === "sessionStats" ? projectionValue.current : undefined), t }))));
+			react.createElement(LiveTpsPill, { key: entryKey, useChat: chat.useChat, useProjection: (key) => (key === "sessionStats" ? projectionValue.current : undefined), t, sessionId, liveTpsSessions: sessions }))));
 	render();
 	await settle();
 	return {
@@ -368,12 +360,45 @@ async function mountScene({ nodes = [], partial = null, showRow = true, rowText 
 			render();
 			await settle();
 		},
+		async setRow(show) {
+			rowState.show = show;
+			render();
+			await settle();
+		},
 		async unmount() {
 			root.unmount();
 			scene.remove();
 			await settle();
 		}
 	};
+}
+
+/* ---------------- ④ 行缺失/出现：容器跟随，且只在"本该有行"时告警 ---------------- */
+{
+	const warns = [];
+	const originalWarn = console.warn;
+	console.warn = (...parts) => warns.push(parts.join(" "));
+	try {
+		// 新会话：还没有已结算步，官方行本来就不渲染（decodeMs=0）→ 不是漂移，不告警
+		const fresh = await mountScene({ nodes: [], showRow: false });
+		eq(fresh.pill().parentElement.hasAttribute("data-slot"), true, "no row keeps the pill in the dock");
+		eq(warns.length, 0, "a session with no settled step must not warn about the missing row");
+
+		// 已有已结算步却没有 stats 行 → 宿主锚点漂移，必须告警一次
+		const broken = await mountScene({ nodes: [settledNode(7, 300, 3_000)], showRow: false });
+		eq(warns.length, 1, "a settled session without a stats row warns once");
+		ok(warns[0].includes("锚点"), "warn text names the anchor drift");
+
+		// 宿主把行渲染出来（结构性 childList 突变）→ pill 迁移进 stats 行
+		await broken.setRow(true);
+		eq(broken.pill().parentElement.getAttribute("data-composer-stat"), "activity", "pill migrates into the activity row once it appears");
+		eq(warns.length, 1, "still only one warn");
+
+		await fresh.unmount();
+		await broken.unmount();
+	} finally {
+		console.warn = originalWarn;
+	}
 }
 
 // ⑧-1 步间歇 / 活跃步但零字符：回落读数来自最近一个已结算步的实测速率，不再是 em dash。
@@ -422,12 +447,27 @@ async function mountScene({ nodes = [], partial = null, showRow = true, rowText 
 	const scene = await mountScene({ nodes: [settledNode(3, 250, 2000)], showRow: false });
 	await new Promise((resolve) => setTimeout(resolve, 300));
 	await settle();
-	eq(scene.scene.querySelector("[data-composer-stats]"), null, "precondition: the host row is gone in compact work-details");
+	eq(scene.scene.querySelector("[data-composer-stat],[data-composer-stats]"), null, "precondition: the host row is gone in compact work-details");
 	const pill = scene.pill();
 	ok(pill !== null, "the pill survives the missing host row");
 	eq(pill.parentElement.hasAttribute("data-slot"), true, "it stays in the dock as the fallback container");
 	eq(pill.textContent, "实时 125 tok/s", "and it still reports a rate");
 	await scene.unmount();
+}
+
+// ⑧-4b 2026-10-03：宿主把输入区统计拆成 activity / usage 两行（新标记
+// `data-composer-stat="<id>"`），旧宿主只有布尔 `data-composer-stats`。三种都要锚定。
+{
+	const cases = [
+		{ rowMarker: "activity", label: "new activity marker", check: (el) => el.getAttribute("data-composer-stat") === "activity" },
+		{ rowMarker: "usage", label: "new usage marker", check: (el) => el.getAttribute("data-composer-stat") === "usage" },
+		{ rowMarker: true, label: "legacy boolean marker", check: (el) => el.hasAttribute("data-composer-stats") }
+	];
+	for (const c of cases) {
+		const scene = await mountScene({ nodes: [settledNode(2, 200, 1500)], rowMarker: c.rowMarker });
+		ok(c.check(scene.pill().parentElement), `pill anchors into the host row via the ${c.label}`);
+		await scene.unmount();
+	}
 }
 
 // ⑧-5 本会话尚无任何已结算步：em dash 仍是唯一正确显示。
@@ -456,7 +496,8 @@ async function mountScene({ nodes = [], partial = null, showRow = true, rowText 
 	await scene.unmount();
 }
 
-// ⑧-7 宿主投影只是最后兜底：只在没有任何客户端实测时（轨迹/记忆页 legacy 为空）才供数。
+// ⑧-7 宿主投影不再供数：没有客户端实测时（轨迹/记忆页 legacy 为空且本页没看过流）
+//      必须停在 em dash，而不是把官方整日志均值当作"实时速度"显示。
 {
 	const scene = await mountScene({
 		nodes: [],
@@ -465,8 +506,8 @@ async function mountScene({ nodes = [], partial = null, showRow = true, rowText 
 	await new Promise((resolve) => setTimeout(resolve, 300));
 	await settle();
 	const pill = scene.pill();
-	eq(pill.textContent, "实时 200 tok/s", "as a last resort the projection still supplies a number when the legacy slice is empty");
-	eq(pill.getAttribute("data-source"), "projection", "and the source is reported for diagnosis");
+	eq(pill.textContent, "实时 \u2014 tok/s", "the whole-session average is never shown as the live rate");
+	eq(pill.getAttribute("data-source"), "none", "no measured source means no reading");
 	eq(pill.getAttribute("data-nodes"), "0", "precondition: no settled nodes in this view");
 	await scene.unmount();
 }
@@ -497,13 +538,13 @@ async function mountScene({ nodes = [], partial = null, showRow = true, rowText 
 	await scene.unmount();
 }
 
-// ⑧-9 悬停提示带读数来源；读不出数时直接告出三个数据源的实况（用户就是靠悬停发现的）。
+// ⑧-9 悬停提示带读数来源；读不出数时直接告出数据源实况（用户就是靠悬停发现的）。
 {
-	const scene = await mountScene({ nodes: [], projection: { steps: 40, decodeMs: 4_000, decodeTokens: 800 } });
+	const scene = await mountScene({ nodes: [settledNode(7, 300, 3_000)], projection: { steps: 40, decodeMs: 4_000, decodeTokens: 800 } });
 	await new Promise((resolve) => setTimeout(resolve, 300));
 	await settle();
-	ok(/200/.test(scene.pill().getAttribute("title")), "the tooltip carries the raw number");
-	ok(/整会话均值/.test(scene.pill().getAttribute("title")), "and names the source, flagging it is not live");
+	ok(/100/.test(scene.pill().getAttribute("title")), "the tooltip carries the raw number");
+	ok(/最近一步实测/.test(scene.pill().getAttribute("title")), "and names the measured source");
 
 	const blind = await mountScene({ nodes: [], projection: undefined });
 	await new Promise((resolve) => setTimeout(resolve, 300));
@@ -513,6 +554,60 @@ async function mountScene({ nodes = [], partial = null, showRow = true, rowText 
 	ok(/已结算步骤：0/.test(hint), "and the settled-step count");
 	await scene.unmount();
 	await blind.unmount();
+}
+
+// ⑧-10 durable 日志源：本页没看过流（刷新 / 换会话 / 非聊天页）时，
+//       从会话自己的事件窗口算出真实末步速率，而不是 em dash 或均值。
+{
+	const entries = [
+		{ event: { type: "user/message", seq: 1, time: 1_000, data: { message: { role: "user", content: [] } } } },
+		{ event: { type: "step/start", seq: 2, time: 1_100, data: { turn: 1, step: 1 } } },
+		{ event: { type: "assistant/message", seq: 3, time: 9_000, data: { turn: 1, step: 1, usage: { outputTokens: 400 }, stream: [{ type: "chunk", time: 5_000, chunk: { type: "reasoning-delta", index: 0, text: "The" } }] } } },
+		{ event: { type: "step/end", seq: 4, time: 9_100, data: { turn: 1, step: 1 } } }
+	];
+	const scene = await mountScene({ nodes: [], durableEntries: entries });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	const pill = scene.pill();
+	eq(pill.textContent, "实时 100 tok/s", "the durable event window supplies the real last-step rate");
+	eq(pill.getAttribute("data-source"), "durable", "and reports the durable source");
+	eq(pill.getAttribute("data-durable"), "present", "the diagnostic attribute reflects the durable source");
+	ok(/日志末步实测/.test(pill.getAttribute("title")), "the tooltip names the durable source");
+
+	// 客户端自己看过的那一步（settled）优先于日志重算：两者都是实测，用本页原始观测。
+	const observed = await mountScene({ nodes: [settledNode(9, 250, 1_000)], durableEntries: entries });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	eq(observed.pill().textContent, "实时 250 tok/s", "a client-observed step outranks the log recomputation of the same quantity");
+	eq(observed.pill().getAttribute("data-source"), "settled", "and the source is the observed one");
+
+	await scene.unmount();
+	await observed.unmount();
+}
+
+// ⑧-11 翻译类插件的整段 replaceChildren 之后，可见文案必须自愈（2026-09-26 的
+//       "鼠标悬停才看到数字、正文停在 em dash"就是这么来的）。
+{
+	const scene = await mountScene({ nodes: [settledNode(7, 300, 3_000)] });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await settle();
+	const pill = scene.pill();
+	eq(pill.textContent, "实时 100 tok/s", "precondition: the measured rate is visible");
+	eq(pill.getAttribute("data-imt-skip"), "", "the pill opts out of DOM-translating plugins");
+	eq(pill.getAttribute("translate"), "no", "and of the generic translate contract");
+	ok(pill.className.includes("notranslate"), "and carries the notranslate class");
+
+	// 模拟沉浸式翻译的写回路径：整段替换 pill 的子节点（React 的文本节点被摘掉）。
+	pill.textContent = "";
+	pill.appendChild(document.createTextNode("实时 \u2014 tok/s"));
+	eq(pill.textContent, "实时 \u2014 tok/s", "precondition: a foreign rewrite froze the visible label");
+
+	// 下一次提交必须修回可见文案（并显示新的真实读数）。
+	await scene.update({ nodes: [settledNode(7, 300, 3_000), settledNode(8, 250, 1_000)] });
+	const healed = scene.pill();
+	eq(healed.textContent, "实时 250 tok/s", "the visible label is repaired after a foreign DOM rewrite");
+	eq(healed.getAttribute("data-tps"), "250", "and it matches the live state attributes");
+	await scene.unmount();
 }
 
 // ⑧-6 空闲期不常驻定时器（v1 的教训：空闲 setInterval 20Hz 常驻烧 CPU）。
